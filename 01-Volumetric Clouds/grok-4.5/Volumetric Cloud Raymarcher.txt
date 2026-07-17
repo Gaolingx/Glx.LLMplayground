@@ -1,0 +1,397 @@
+// ============================================================================
+//  Volumetric Cloud Raymarcher - ShaderToy
+//  Pure procedural FBM clouds with single + multi-scatter approximation,
+//  Henyey-Greenstein phase, soft self-shadowing, free-look camera.
+//  Paste directly into https://www.shadertoy.com/new
+// ============================================================================
+
+// -------------------- TUNABLE PARAMETERS --------------------
+#define CLOUD_BOTTOM        1.2
+#define CLOUD_TOP           3.8
+#define CLOUD_COVERAGE      0.42      // higher = more coverage
+#define CLOUD_DENSITY       0.55      // overall optical density
+#define CLOUD_SCALE         0.35
+#define WIND_SPEED          0.08
+#define WIND_DIR            vec2(1.0, 0.35)
+
+#define PRIMARY_STEPS       96
+#define LIGHT_STEPS         8
+#define MAX_DIST            80.0
+#define MIN_TRANSMITTANCE   0.01
+
+#define SUN_DIR             normalize(vec3(0.6, 0.45, 0.3))
+#define SUN_COLOR           vec3(1.0, 0.92, 0.78)
+#define SUN_INTENSITY       22.0
+#define AMBIENT_COLOR       vec3(0.45, 0.55, 0.75)
+#define AMBIENT_INTENSITY   0.65
+
+#define HG_G_FORWARD        0.65
+#define HG_G_BACK           -0.25
+#define SCATTER_COEFF       0.9
+#define EXTINCT_COEFF       1.0
+
+#define CAMERA_DIST         6.5
+#define CAMERA_HEIGHT       0.8
+// ------------------------------------------------------------
+
+// Hash & Noise (value noise)
+float hash12(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+float hash13(vec3 p3) {
+    p3  = fract(p3 * 0.1031);
+    p3 += dot(p3, p3.zyx + 31.32);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+float valueNoise(vec3 x) {
+    vec3 i = floor(x);
+    vec3 f = fract(x);
+    f = f * f * (3.0 - 2.0 * f);
+
+    float n000 = hash13(i + vec3(0,0,0));
+    float n100 = hash13(i + vec3(1,0,0));
+    float n010 = hash13(i + vec3(0,1,0));
+    float n110 = hash13(i + vec3(1,1,0));
+    float n001 = hash13(i + vec3(0,0,1));
+    float n101 = hash13(i + vec3(1,0,1));
+    float n011 = hash13(i + vec3(0,1,1));
+    float n111 = hash13(i + vec3(1,1,1));
+
+    float nx00 = mix(n000, n100, f.x);
+    float nx10 = mix(n010, n110, f.x);
+    float nx01 = mix(n001, n101, f.x);
+    float nx11 = mix(n011, n111, f.x);
+
+    float nxy0 = mix(nx00, nx10, f.y);
+    float nxy1 = mix(nx01, nx11, f.y);
+
+    return mix(nxy0, nxy1, f.z);
+}
+
+// Multi-octave FBM + domain warp for fluffy structure
+float fbm(vec3 p) {
+    float f = 0.0;
+    float amp = 0.5;
+    mat3 m = mat3( 0.00,  0.80,  0.60,
+                  -0.80,  0.36, -0.48,
+                  -0.60, -0.48,  0.64);
+    for (int i = 0; i < 5; i++) {
+        f += amp * valueNoise(p);
+        p = m * p * 2.02;
+        amp *= 0.5;
+    }
+    return f;
+}
+
+float ridgedFbm(vec3 p) {
+    float f = 0.0;
+    float amp = 0.5;
+    for (int i = 0; i < 4; i++) {
+        float n = valueNoise(p);
+        n = 1.0 - abs(n * 2.0 - 1.0); // ridged
+        f += amp * n;
+        p *= 2.1;
+        amp *= 0.5;
+    }
+    return f;
+}
+
+// Cloud density field
+float cloudMap(vec3 p) {
+    // Wind animation
+    vec3 q = p;
+    q.xz += iTime * WIND_SPEED * WIND_DIR;
+
+    // Large-scale shape + medium detail
+    float base = fbm(q * CLOUD_SCALE);
+    // Domain warping for more organic forms
+    vec3 warp = vec3(fbm(q * 0.7 + 3.1), fbm(q * 0.7 + 17.3), fbm(q * 0.7 + 29.7));
+    float detail = fbm(q * CLOUD_SCALE * 2.4 + warp * 0.9);
+    float ridged = ridgedFbm(q * CLOUD_SCALE * 1.6 + 5.0);
+
+    float n = base * 0.55 + detail * 0.35 + ridged * 0.25;
+    n = n * 0.5 + 0.5; // [0,1]
+
+    // Vertical density profile (fluffy bottoms, thinner tops)
+    float h = p.y;
+    float heightGradient = smoothstep(CLOUD_BOTTOM, CLOUD_BOTTOM + 0.6, h) *
+                           smoothstep(CLOUD_TOP, CLOUD_TOP - 1.1, h);
+    // Soft top falloff
+    heightGradient *= 1.0 - smoothstep(CLOUD_TOP - 0.8, CLOUD_TOP, h) * 0.6;
+
+    // Coverage remap (IQ style)
+    float dens = n - (1.0 - CLOUD_COVERAGE);
+    dens = dens / CLOUD_COVERAGE;
+    dens = clamp(dens, 0.0, 1.0);
+    dens *= heightGradient;
+
+    // Fine wisps
+    dens *= mix(0.6, 1.0, ridgedFbm(q * 3.5));
+
+    return dens * CLOUD_DENSITY;
+}
+
+// Henyey-Greenstein phase function
+float henyeyGreenstein(float cosTheta, float g) {
+    float g2 = g * g;
+    return (1.0 - g2) / (4.0 * 3.14159265 * pow(1.0 + g2 - 2.0 * g * cosTheta, 1.5));
+}
+
+// Dual-lobe phase for realistic clouds
+float phaseFunction(float cosTheta) {
+    float forward = henyeyGreenstein(cosTheta, HG_G_FORWARD);
+    float back    = henyeyGreenstein(cosTheta, HG_G_BACK);
+    return mix(forward, back, 0.35) + 0.15; // small isotropic term
+}
+
+// Approximate multiple scattering (cheap energy conservation)
+vec3 multiScatterApprox(float dens, float lightTrans, float cosTheta) {
+    // Simple isotropic multi-scatter + powder sugar effect
+    float powder = 1.0 - exp(-dens * 2.0);
+    float multi  = powder * (0.5 + 0.5 * lightTrans);
+    return vec3(multi) * mix(0.8, 1.2, cosTheta * 0.5 + 0.5);
+}
+
+// Secondary ray for soft self-shadowing
+float lightMarch(vec3 pos, vec3 sunDir) {
+    float t = 0.0;
+    float shadow = 1.0;
+    float stepLen = (CLOUD_TOP - CLOUD_BOTTOM) / float(LIGHT_STEPS) * 0.85;
+
+    // Small random offset to reduce banding
+    t += hash13(pos * 17.13 + iTime) * stepLen * 0.5;
+
+    for (int i = 0; i < LIGHT_STEPS; i++) {
+        vec3 samplePos = pos + sunDir * t;
+        // Early out if outside cloud slab
+        if (samplePos.y < CLOUD_BOTTOM || samplePos.y > CLOUD_TOP) break;
+
+        float dens = cloudMap(samplePos);
+        shadow *= exp(-dens * EXTINCT_COEFF * stepLen * 1.4);
+        if (shadow < 0.02) break;
+        t += stepLen;
+    }
+    return shadow;
+}
+
+// Simple ground plane for scale (optional, soft)
+vec3 groundColor(vec3 ro, vec3 rd, out float tHit) {
+    tHit = -1.0;
+    if (rd.y >= -0.001) return vec3(0.0);
+    tHit = -ro.y / rd.y;
+    if (tHit < 0.0) return vec3(0.0);
+
+    vec3 pos = ro + rd * tHit;
+    // Cheap procedural ground
+    float n = fbm(vec3(pos.xz * 0.15, 0.0));
+    vec3 col = mix(vec3(0.18, 0.22, 0.12), vec3(0.32, 0.38, 0.22), n);
+    // Distance fog toward horizon
+    float fog = exp(-0.015 * tHit);
+    return col * fog;
+}
+
+// Atmospheric sky + sun disk
+vec3 skyColor(vec3 rd, vec3 sunDir) {
+    float sunDot = max(dot(rd, sunDir), 0.0);
+
+    // Rayleigh-ish gradient
+    vec3 zenith = vec3(0.15, 0.28, 0.55);
+    vec3 horizon = vec3(0.55, 0.65, 0.85);
+    float h = rd.y * 0.5 + 0.5;
+    vec3 sky = mix(horizon, zenith, pow(h, 0.65));
+
+    // Warm horizon glow
+    sky = mix(sky, vec3(0.85, 0.55, 0.35), exp(-rd.y * 8.0) * 0.4);
+
+    // Sun disk + glow
+    float sunDisk = smoothstep(0.9995, 0.9998, sunDot);
+    float sunGlow = pow(sunDot, 12.0) * 0.6 + pow(sunDot, 80.0) * 0.8;
+    sky += SUN_COLOR * (sunDisk * 8.0 + sunGlow * 1.5);
+
+    // Subtle high-altitude haze
+    sky += vec3(0.4, 0.5, 0.7) * exp(-abs(rd.y) * 4.0) * 0.15;
+
+    return sky;
+}
+
+// Camera setup (free-look + auto-orbit)
+void camera(in vec2 uv, out vec3 ro, out vec3 rd) {
+    vec2 m = iMouse.xy / iResolution.xy;
+    bool mouseActive = iMouse.z > 0.0;
+
+    float yaw, pitch;
+    if (mouseActive) {
+        yaw   = (m.x - 0.5) * 6.283185;
+        pitch = (m.y - 0.5) * 2.5;
+    } else {
+        // Auto orbit
+        yaw   = iTime * 0.07;
+        pitch = 0.18 + 0.12 * sin(iTime * 0.11);
+    }
+    pitch = clamp(pitch, -1.2, 1.3);
+
+    // Orbit camera around look-at point
+    vec3 ta = vec3(0.0, 1.6, 0.0);
+    float cy = cos(yaw), sy = sin(yaw);
+    float cp = cos(pitch), sp = sin(pitch);
+
+    ro = ta + vec3(sy * cp, sp, cy * cp) * CAMERA_DIST;
+    ro.y = max(ro.y, CAMERA_HEIGHT);
+
+    // Basis
+    vec3 ww = normalize(ta - ro);
+    vec3 uu = normalize(cross(ww, vec3(0,1,0)));
+    vec3 vv = cross(uu, ww);
+
+    // Ray direction (perspective)
+    rd = normalize(uv.x * uu + uv.y * vv + 1.65 * ww);
+}
+
+// ACES filmic tonemap (approx)
+vec3 ACESFilm(vec3 x) {
+    float a = 2.51;
+    float b = 0.03;
+    float c = 2.43;
+    float d = 0.59;
+    float e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
+// Main volumetric integration
+vec3 renderClouds(vec3 ro, vec3 rd, vec3 sunDir, out float transmittance) {
+    transmittance = 1.0;
+    vec3 scatteredLight = vec3(0.0);
+
+    // Compute cloud slab intersection
+    float tBottom = (CLOUD_BOTTOM - ro.y) / rd.y;
+    float tTop    = (CLOUD_TOP    - ro.y) / rd.y;
+
+    float tEnter = min(tBottom, tTop);
+    float tExit  = max(tBottom, tTop);
+
+    // Handle camera inside or below/above
+    if (ro.y > CLOUD_BOTTOM && ro.y < CLOUD_TOP) {
+        tEnter = 0.0;
+    }
+    tEnter = max(tEnter, 0.0);
+    tExit  = min(tExit, MAX_DIST);
+
+    if (tEnter >= tExit) {
+        return vec3(0.0); // no intersection
+    }
+
+    float dist = tExit - tEnter;
+    float stepSize = dist / float(PRIMARY_STEPS);
+
+    // Jitter start to reduce banding
+    float jitter = hash12(gl_FragCoord.xy + iTime * 0.1);
+    float t = tEnter + jitter * stepSize;
+
+    vec3 sunColor = SUN_COLOR * SUN_INTENSITY;
+
+    for (int i = 0; i < PRIMARY_STEPS; i++) {
+        if (t > tExit || transmittance < MIN_TRANSMITTANCE) break;
+
+        vec3 pos = ro + rd * t;
+        float dens = cloudMap(pos);
+
+        if (dens > 0.001) {
+            // Lighting
+            float lightTrans = lightMarch(pos, sunDir);
+            float cosTheta = dot(rd, sunDir);
+            float phase = phaseFunction(cosTheta);
+
+            // Single scatter
+            vec3 single = sunColor * lightTrans * phase * SCATTER_COEFF;
+
+            // Multi-scatter approx + ambient
+            vec3 multi = multiScatterApprox(dens, lightTrans, cosTheta) * sunColor * 0.35;
+            vec3 ambient = AMBIENT_COLOR * AMBIENT_INTENSITY * (0.4 + 0.6 * lightTrans);
+
+            // Total in-scattered light this sample
+            vec3 S = (single + multi + ambient) * dens;
+
+            // Beer-Lambert integration (analytic for constant dens over step)
+            float sampleAtt = exp(-dens * EXTINCT_COEFF * stepSize);
+            // Energy conserving accumulation
+            scatteredLight += transmittance * S * (1.0 - sampleAtt) / max(dens * EXTINCT_COEFF, 1e-4);
+            transmittance *= sampleAtt;
+        }
+
+        t += stepSize;
+    }
+
+    return scatteredLight;
+}
+
+void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+    // Normalized coordinates (aspect correct)
+    vec2 uv = (2.0 * fragCoord - iResolution.xy) / iResolution.y;
+
+    // Camera
+    vec3 ro, rd;
+    camera(uv, ro, rd);
+
+    vec3 sunDir = SUN_DIR;
+
+    // Optional: mouse controls sun when right button or always if desired
+    // (here we keep fixed sun for stability; uncomment for interactive sun)
+    /*
+    if (iMouse.z > 0.0) {
+        vec2 sm = iMouse.xy / iResolution.xy;
+        float sy = (sm.x - 0.5) * 3.14159;
+        float sp = (sm.y - 0.1) * 1.4;
+        sunDir = normalize(vec3(sin(sy)*cos(sp), sin(sp)+0.15, cos(sy)*cos(sp)));
+    }
+    */
+
+    // Background sky
+    vec3 col = skyColor(rd, sunDir);
+
+    // Optional ground
+    float tGround;
+    vec3 gCol = groundColor(ro, rd, tGround);
+    if (tGround > 0.0) {
+        // Soft composite ground with distance fog already applied
+        float groundFog = exp(-0.012 * tGround);
+        col = mix(col, gCol, groundFog * 0.85);
+    }
+
+    // Volumetric clouds
+    float transmittance;
+    vec3 cloudLight = renderClouds(ro, rd, sunDir, transmittance);
+
+    // Composite clouds over sky (and ground)
+    col = cloudLight + transmittance * col;
+
+    // Mild god-ray / crepuscular approximation (cheap screen-space-ish)
+    float sunAmount = max(dot(rd, sunDir), 0.0);
+    float god = pow(sunAmount, 8.0) * 0.15 * transmittance;
+    col += SUN_COLOR * god;
+
+    // Exposure + tonemapping
+    col *= 0.85; // exposure
+    col = ACESFilm(col);
+
+    // Subtle contrast / saturation
+    col = pow(col, vec3(0.95));
+    float luma = dot(col, vec3(0.299, 0.587, 0.114));
+    col = mix(vec3(luma), col, 1.08);
+
+    // Vignette
+    vec2 q = fragCoord / iResolution.xy;
+    col *= 0.7 + 0.3 * pow(16.0 * q.x * q.y * (1.0 - q.x) * (1.0 - q.y), 0.25);
+
+    // Very mild temporal grain (helps hide residual banding)
+    float grain = (hash12(fragCoord + fract(iTime * 17.3)) - 0.5) * 0.025;
+    col += grain;
+
+    // Gamma
+    col = pow(clamp(col, 0.0, 1.0), vec3(1.0 / 2.2));
+
+    fragColor = vec4(col, 1.0);
+}

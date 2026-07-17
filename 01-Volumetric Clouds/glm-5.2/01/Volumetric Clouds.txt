@@ -1,0 +1,289 @@
+// =====================================================================
+// Volumetric Clouds — Single-Pass Raymarcher
+// Paste into https://www.shadertoy.com/new  (no external textures required)
+//
+// Mouse drag : orbit camera around cloudscape (click + hold + drag)
+// Idle       : gentle auto-orbit
+//
+// Features:
+//   - Multi-octave value-noise FBM with domain warp + ridged detail
+//   - Beer-Lambert volume integration, early ray termination
+//   - Henyey-Greenstein dual-lobe phase function
+//   - Single + cheap multiple scattering, powder effect, ambient sky light
+//   - Soft self-shadow via short cone march toward the sun
+//   - Sky gradient + sun disk/glow, ACES tonemap, vignette, grain dither
+// =====================================================================
+
+// ---------- Tunable Parameters ---------------------------------------
+#define CLOUD_BASE      1000.0                       // bottom of cloud slab (world units)
+#define CLOUD_TOP       2500.0                       // top of cloud slab
+#define CLOUD_THICK     (CLOUD_TOP - CLOUD_BASE)
+#define DENSITY_SCALE   1.10                         // global density multiplier
+#define COVERAGE        0.55                         // cloud coverage 0..1
+#define WIND_SPEED      22.0                         // wind drift speed
+#define WIND_DIR        vec2(0.85, 0.25)             // wind horizontal direction
+
+#define PRIMARY_STEPS   64                           // primary march steps
+#define LIGHT_STEPS     6                            // shadow march steps
+#define MAX_DIST        16000.0                      // render cutoff distance
+
+#define SUN_DIR         normalize(vec3(0.5, 0.55, 0.6))
+#define SUN_COLOR       (vec3(1.0, 0.85, 0.60) * 6.0)
+#define SKY_TOP         vec3(0.18, 0.40, 0.78)
+#define SKY_HORIZON     vec3(0.72, 0.80, 0.92)
+#define SKY_BOT         vec3(0.85, 0.83, 0.82)
+#define AMBIENT_TOP     vec3(0.36, 0.52, 0.80)
+#define AMBIENT_BOT     vec3(0.50, 0.45, 0.50)
+#define EXT_COEF        0.011                        // light march extinction coefficient
+
+#define G_FWD            0.6                          // forward HG anisotropy
+#define G_BACK          -0.3                          // backward HG anisotropy
+#define SCAT_MIX        0.7                           // forward vs backward lobe mix
+
+#define PI              3.14159265359
+
+// ---------- Hash & Value Noise ---------------------------------------
+float hash13(vec3 p){
+    p = fract(p * 0.1031);
+    p += dot(p, p.yzx + 33.33);
+    return fract((p.x + p.y) * p.z);
+}
+
+float vnoise(vec3 x){
+    vec3 i = floor(x);
+    vec3 f = fract(x);
+    f = f*f*(3.0 - 2.0*f);
+    float n000 = hash13(i + vec3(0,0,0));
+    float n100 = hash13(i + vec3(1,0,0));
+    float n010 = hash13(i + vec3(0,1,0));
+    float n110 = hash13(i + vec3(1,1,0));
+    float n001 = hash13(i + vec3(0,0,1));
+    float n101 = hash13(i + vec3(1,0,1));
+    float n011 = hash13(i + vec3(0,1,1));
+    float n111 = hash13(i + vec3(1,1,1));
+    return mix(mix(mix(n000,n100,f.x), mix(n010,n110,f.x), f.y),
+               mix(mix(n001,n101,f.x), mix(n011,n111,f.x), f.y), f.z);
+}
+
+// 0..1 FBM
+float fbm(vec3 p, int oct){
+    float a = 0.5, s = 0.0, n = 0.0;
+    for(int i=0; i<8; i++){
+        if(i>=oct) break;
+        s += a * vnoise(p);
+        n += a;
+        p = p*2.02 + vec3(1.7, 9.2, 3.3);
+        a *= 0.5;
+    }
+    return s / max(n, 1e-4);
+}
+
+// ---------- Cloud Density --------------------------------------------
+// Returns density in [0, ~1.5]. 0 = empty air.
+float cloudDensity(vec3 p, float t){
+    // Vertical fraction inside layer
+    float h = clamp((p.y - CLOUD_BASE) / CLOUD_THICK, 0.0, 1.0);
+
+    // Horizontal wind drift
+    vec2 wind = WIND_DIR * (t * WIND_SPEED);
+
+    // Large-scale coordinates
+    vec3 q = p * 0.0009 + vec3(wind.x, 0.0, wind.y) * 0.0009;
+
+    // Domain warp for wispy, evolving structure (cheap 2-octave each)
+    vec3 w;
+    w.x = fbm(q*1.3 + 5.2, 2);
+    w.y = fbm(q*1.3 + 1.7, 2);
+    w.z = fbm(q*1.3 + 9.3, 2);
+    q += (w - 0.5) * 0.65;
+
+    // Base cloud shape (5 octaves), shaped by coverage
+    float shape = fbm(q, 5);
+    shape = smoothstep(1.0 - COVERAGE, 1.0 - COVERAGE + 0.35, shape);
+
+    // Medium + fine detail via ridged noise for billowing edges
+    vec3 dq = p * 0.0045 + vec3(wind.x, 0.0, wind.y) * 0.0045;
+    float det = fbm(dq, 3);
+    float ridged = 1.0 - det;
+    ridged *= ridged;
+
+    float d = shape * (0.65 + 0.55*det) - shape * ridged * 0.25;
+
+    // Vertical falloff: thicker middle, wispy top, dense bottom
+    float vert = smoothstep(0.0, 0.15, h) * smoothstep(1.0, 0.65, h);
+    d *= vert;
+
+    return max(d, 0.0) * DENSITY_SCALE;
+}
+
+// ---------- Phase Functions ------------------------------------------
+float hg(float c, float g){
+    float g2 = g*g;
+    return (1.0 - g2) / pow(1.0 + g2 - 2.0*g*c, 1.5);
+}
+float phase(float c){
+    // Dual-lobe: forward + backward scattering
+    return mix(hg(c, G_BACK), hg(c, G_FWD), SCAT_MIX);
+}
+
+// ---------- Sky ------------------------------------------------------
+vec3 skyColor(vec3 rd){
+    float y = rd.y;
+    vec3 sky;
+    if(y > 0.0){
+        sky = mix(SKY_HORIZON, SKY_TOP, pow(clamp(y,0.0,1.0), 0.55));
+    } else {
+        sky = mix(SKY_HORIZON, SKY_BOT, clamp(-y/0.4, 0.0, 1.0));
+    }
+    // Sun disk + atmospheric glow
+    float sd = max(dot(rd, SUN_DIR), 0.0);
+    sky += SUN_COLOR * pow(sd, 3500.0) * 1.2;  // disk
+    sky += SUN_COLOR * pow(sd, 256.0)  * 0.20; // tight halo
+    sky += SUN_COLOR * pow(sd, 12.0)   * 0.045;// wide halo
+    return sky;
+}
+
+// ---------- Camera ---------------------------------------------------
+mat3 setCamera(vec3 ro, vec3 ta, float cr){
+    vec3 cw = normalize(ta - ro);
+    vec3 cp = vec3(sin(cr), cos(cr), 0.0);
+    vec3 cu = normalize(cross(cw, cp));
+    vec3 cv = cross(cu, cw);
+    return mat3(cu, cv, cw);
+}
+
+// ---------- Volume Raymarch ------------------------------------------
+// Returns rgb=in-scattered radiance, a=remaining transmittance
+vec4 raymarchClouds(vec3 ro, vec3 rd, float t0, float t1, float time, float dither){
+    float dt  = (t1 - t0) / float(PRIMARY_STEPS);
+    float t   = t0 + dt * dither;        // dither first sample to break banding
+
+    float transmittance = 1.0;
+    vec3  scattered = vec3(0.0);
+
+    float cosT = dot(rd, SUN_DIR);
+    float ph   = phase(cosT);
+
+    for(int i=0; i<PRIMARY_STEPS; i++){
+        vec3 p = ro + rd * t;
+        float density = cloudDensity(p, time);
+
+        if(density > 0.002){
+            float od = density * dt;     // optical depth this step
+
+            // --- Light march toward sun (cone-ish, exponentially spaced) ---
+            float lightOD = 0.0;
+            vec3 lp = p + SUN_DIR * 30.0;
+            float lstep = 30.0;
+            for(int j=0; j<LIGHT_STEPS; j++){
+                lightOD += cloudDensity(lp, time) * lstep;
+                lp += SUN_DIR * lstep;
+                lstep *= 1.65;
+            }
+            float lTrans = exp(-lightOD * EXT_COEF);
+
+            // Beer-Powder: dark core, bright edges (silver lining)
+            float beer   = exp(-od);
+            float powder = 1.0 - exp(-od * 2.0);
+
+            // Height-based ambient (sky bounce from above, ground from below)
+            float hf = clamp((p.y - CLOUD_BASE) / CLOUD_THICK, 0.0, 1.0);
+            vec3 ambient = mix(AMBIENT_BOT, AMBIENT_TOP, hf);
+
+            // Single scatter from sun + cheap multiple scatter approximation
+            vec3 sunScat   = SUN_COLOR * lTrans * (beer + powder*0.3) * ph;
+            vec3 ambScat   = ambient * (0.55 + 0.45 * lTrans);
+            vec3 multiScat = SUN_COLOR * 0.13 * lTrans * lTrans;
+
+            vec3 L = (sunScat + ambScat + multiScat) * density;
+
+            scattered += transmittance * L * dt;
+            transmittance *= beer;
+
+            if(transmittance < 0.01) break;
+        }
+        t += dt;
+        if(t > t1) break;
+    }
+    return vec4(scattered, transmittance);
+}
+
+// ---------- Tonemap --------------------------------------------------
+vec3 ACES(vec3 x){
+    const float a=2.51, b=0.03, c=2.43, d=0.59, e=0.14;
+    return clamp((x*(a*x+b))/(x*(c*x+d)+e), 0.0, 1.0);
+}
+
+// ---------- Main -----------------------------------------------------
+void mainImage(out vec4 fragColor, in vec2 fragCoord){
+    vec2 uv = fragCoord / iResolution.xy;
+    vec2 p  = (uv - 0.5) * vec2(iResolution.x/iResolution.y, 1.0);
+
+    float time = iTime;
+
+    // --- Camera orbit (mouse drag or auto) ---
+    vec2 mo = iMouse.xy / max(iResolution.xy, vec2(1.0));
+    float angle, heightFrac;
+    if(iMouse.z > 0.5){
+        angle      = (mo.x - 0.5) * 6.2831;
+        heightFrac = clamp(mo.y * 1.5, 0.0, 1.2);
+    } else {
+        angle      = time * 0.045;
+        heightFrac = 0.35 + 0.10 * sin(time * 0.15);
+    }
+
+    float camR = 2800.0;
+    vec3 ro = vec3(cos(angle)*camR,
+                   mix(150.0, 3200.0, heightFrac),
+                   sin(angle)*camR);
+    vec3 ta = vec3(0.0, CLOUD_BASE + CLOUD_THICK*0.4, 0.0);
+    mat3 cam = setCamera(ro, ta, 0.0);
+
+    vec3 rd = normalize(cam * vec3(p, 1.5));
+
+    // --- Sky background ---
+    vec3 col = skyColor(rd);
+
+    // --- Intersect cloud slab [CLOUD_BASE, CLOUD_TOP] ---
+    float tEnter = 0.0, tExit = 0.0;
+    bool  hit = false;
+    if(abs(rd.y) > 1e-5){
+        float ta1 = (CLOUD_BASE - ro.y) / rd.y;
+        float ta2 = (CLOUD_TOP  - ro.y) / rd.y;
+        float a1 = min(ta1, ta2);
+        float a2 = max(ta1, ta2);
+        if(a2 > 0.0){
+            tEnter = max(a1, 0.0);
+            tExit  = min(a2, MAX_DIST);
+            hit    = true;
+        }
+    }
+
+    if(hit && tEnter < tExit){
+        // Blue-noise-ish per-pixel dither (uses frame to animate)
+        float dither = hash13(vec3(fragCoord, float(iFrame)));
+        vec4 clouds = raymarchClouds(ro, rd, tEnter, tExit, time, dither);
+        // Composite over sky: rgb scatter + (1-alpha) * sky
+        col = clouds.rgb + col * clouds.a;
+    }
+
+    // --- Tonemap ---
+    col = ACES(col * 1.05);
+
+    // --- Vignette ---
+    vec2 vu = uv - 0.5;
+    col *= 1.0 - dot(vu, vu) * 0.55;
+
+    // --- Color grade: warm highlights, slight saturation boost ---
+    col = pow(clamp(col, 0.0, 1.0), vec3(0.92));
+    float lum = dot(col, vec3(0.299, 0.587, 0.114));
+    col = mix(vec3(lum), col, 1.08);
+    col.r *= 1.02;
+    col.b *= 0.99;
+
+    // --- Subtle grain ---
+    float g = hash13(vec3(fragCoord*1.3, time + float(iFrame))) - 0.5;
+    col += g * 0.012;
+
+    fragColor = vec4(col, 1.0);
+}
