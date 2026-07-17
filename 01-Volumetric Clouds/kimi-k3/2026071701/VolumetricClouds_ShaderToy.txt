@@ -1,0 +1,312 @@
+//============================================================================
+//  VOLUMETRIC CLOUD RAYMARCHER — single-pass, 100% procedural (no textures)
+//
+//  Paste into https://www.shadertoy.com/new  (Image pass only).
+//
+//  CONTROLS
+//    - Hold & drag mouse : free-look camera
+//    - Mouse released    : cinematic auto-flight
+//
+//  TECHNIQUE
+//    - Density : multi-octave value-noise FBM + low-frequency 2D coverage map
+//    - Marching: fixed-step volume integration, Beer-Lambert transmittance,
+//                energy-conserving scattering step, early termination,
+//                per-pixel hash dithering against banding
+//    - Lighting: multi-lobe Henyey-Greenstein phase (backward + forward +
+//                silver-lining spike), short sun raymarch for self-shadowing,
+//                Beer-powder rim darkening, height-graded sky ambient
+//    - Post    : ACES tonemap, gamma, saturation/contrast, vignette, grain
+//============================================================================
+
+//------------------------- ARTISTIC CONTROLS -------------------------------
+#define CLOUD_BOTTOM    0.9     // world height of the cloud layer base
+#define CLOUD_TOP       3.2     // world height of the cloud layer top
+#define COVERAGE        0.44    // average cloud coverage [0..1]
+#define DENSITY         6.0     // extinction coefficient inside clouds
+#define PRIMARY_STEPS   96      // view ray steps (64..128)
+#define LIGHT_STEPS     6       // shadow ray steps (4..8)
+#define FAR_CLIP        32.0    // max march distance (clouds fade before it)
+#define SUN_DIR         normalize(vec3(0.55, 0.35, 0.35))  // direction TOWARD the sun
+#define SUN_COLOR       vec3(1.30, 0.80, 0.45)             // warm golden-hour sun
+#define SUN_INTENSITY   3.2
+#define WIND            vec2(0.80, 0.45)                   // cloud drift direction
+#define CAMERA_SPEED    0.9                                // auto-flight speed
+#define AMBIENT_TOP     vec3(0.40, 0.48, 0.70)             // sky light on cloud tops
+#define AMBIENT_BOT     vec3(0.44, 0.40, 0.44)             // bounce light on cloud bases
+//---------------------------------------------------------------------------
+
+const float PI = 3.14159265359;
+
+//------------------------------ noise --------------------------------------
+// Dave-Hoskins-style hash (no sine, good precision behaviour)
+float hash13(vec3 p)
+{
+    p = fract(p * 0.1031);
+    p += dot(p, p.zyx + 31.32);
+    return fract((p.x + p.y) * p.z);
+}
+
+// trilinearly interpolated value noise
+float vnoise(vec3 p)
+{
+    vec3 i = floor(p);
+    vec3 f = fract(p);
+    vec3 u = f * f * (3.0 - 2.0 * f);
+
+    float n000 = hash13(i);
+    float n100 = hash13(i + vec3(1.0, 0.0, 0.0));
+    float n010 = hash13(i + vec3(0.0, 1.0, 0.0));
+    float n110 = hash13(i + vec3(1.0, 1.0, 0.0));
+    float n001 = hash13(i + vec3(0.0, 0.0, 1.0));
+    float n101 = hash13(i + vec3(1.0, 0.0, 1.0));
+    float n011 = hash13(i + vec3(0.0, 1.0, 1.0));
+    float n111 = hash13(i + vec3(1.0, 1.0, 1.0));
+
+    return mix(mix(mix(n000, n100, u.x),
+                   mix(n010, n110, u.x), u.y),
+               mix(mix(n001, n101, u.x),
+                   mix(n011, n111, u.x), u.y), u.z);
+}
+
+// 4-octave FBM — primary cloud silhouette
+float fbm4(vec3 p)
+{
+    float f = 0.0;
+    float a = 0.5;
+    for (int i = 0; i < 4; i++)
+    {
+        f += a * vnoise(p);
+        p  = p * 2.03 + vec3(19.7, 7.3, 11.1);
+        a *= 0.5;
+    }
+    return f;
+}
+
+// 3-octave FBM — fine wispy detail / edge erosion
+float fbm3(vec3 p)
+{
+    float f = 0.0;
+    float a = 0.5;
+    for (int i = 0; i < 3; i++)
+    {
+        f += a * vnoise(p);
+        p  = p * 2.11 + vec3(9.2, 3.7, 5.9);
+        a *= 0.5;
+    }
+    return f;
+}
+
+//--------------------------- cloud density ---------------------------------
+float cloudDensity(vec3 p, bool withDetail)
+{
+    float h = (p.y - CLOUD_BOTTOM) / (CLOUD_TOP - CLOUD_BOTTOM);
+    if (h < 0.0 || h > 1.0) return 0.0;
+
+    // wind advection of the whole volume
+    vec3 q = p;
+    q.xz -= WIND * (iTime * 0.35);
+
+    // low-frequency 2D coverage map -> cloud fields & clear patches
+    float covMap = vnoise(vec3(q.x, 0.0, q.z) * 0.08);
+    float cov    = clamp(COVERAGE + (covMap - 0.5) * 0.55, 0.05, 0.98);
+
+    // large-scale billow shape (steep remap -> dense cores, firm edges)
+    float base = fbm4(q * 0.45);
+    float d = clamp((base - (1.0 - cov)) / max(cov * 0.35, 0.001), 0.0, 1.0);
+    if (d <= 0.0) return 0.0;
+
+    // vertical profile: flat-ish base, tall cauliflower top
+    float grad = smoothstep(0.02, 0.25, h) * (1.0 - smoothstep(0.70, 1.0, h));
+    d *= grad;
+    if (d <= 0.0 || !withDetail) return d;
+
+    // erode edges with animated high-frequency wisps
+    vec3 r = p * 2.3;
+    r.xz -= WIND * (iTime * 0.60);
+    r.y  -= iTime * 0.08;
+    float detail = fbm3(r);
+    d = clamp(d - detail * 0.34 * (1.0 - d), 0.0, 1.0);
+    d = clamp(d * (0.75 + 0.50 * detail), 0.0, 1.0);  // internal density texture
+    return d;
+}
+
+//-------------------------- sun visibility ---------------------------------
+// short raymarch toward the sun: Beer-Lambert + "powder" rim darkening
+float sunVisibility(vec3 p)
+{
+    float dist = min((CLOUD_TOP - CLOUD_BOTTOM) / max(SUN_DIR.y, 0.18), 6.0);
+    float ds   = dist / float(LIGHT_STEPS);
+    float od   = 0.0;
+    for (int i = 0; i < LIGHT_STEPS; i++)
+    {
+        vec3 sp = p + SUN_DIR * (ds * (float(i) + 0.5));
+        od += cloudDensity(sp, false) * DENSITY * ds;
+    }
+    float beer   = exp(-od);
+    float powder = 1.0 - exp(-od * 2.0);   // thin fringes read a touch darker
+    return beer * mix(1.0, powder, 0.6);
+}
+
+//---------------------------- phase function -------------------------------
+float hgPhase(float mu, float g)
+{
+    float g2 = g * g;
+    return (1.0 - g2) / (4.0 * PI * pow(1.0 + g2 - 2.0 * g * mu, 1.5));
+}
+
+//-------------------------------- sky --------------------------------------
+vec3 skyColor(vec3 rd)
+{
+    float mu = dot(rd, SUN_DIR);
+    float y  = clamp(rd.y, 0.0, 1.0);
+
+    // gradient: cool zenith, warm haze near the sun's azimuth
+    vec3 zen = vec3(0.08, 0.24, 0.62);
+    vec3 hor = mix(vec3(0.66, 0.62, 0.68),
+                   vec3(1.05, 0.62, 0.38),
+                   pow(clamp(mu * 0.5 + 0.5, 0.0, 1.0), 3.0));
+    vec3 sky = mix(hor, zen, pow(y, 0.55));
+
+    // sun disk + halo
+    sky += SUN_COLOR * SUN_INTENSITY * (0.12 * pow(max(mu, 0.0), 12.0)
+                                      + 6.0  * pow(max(mu, 0.0), 900.0));
+    // cheap forward-scatter haze
+    sky += vec3(0.30, 0.22, 0.15) * pow(max(mu, 0.0), 3.0) * (1.0 - y) * 0.35;
+    return sky;
+}
+
+//---------------------------- ground plane ---------------------------------
+vec3 groundColor(vec3 gp, float t)
+{
+    float n = fbm4(gp * 0.50);
+    vec3  g = mix(vec3(0.16, 0.24, 0.10), vec3(0.38, 0.34, 0.18), n);
+
+    // fake cloud shadows drifting with the same wind
+    vec3 sq = gp;
+    sq.xz -= WIND * (iTime * 0.35);
+    float sh = smoothstep(0.42, 0.75, fbm3(sq * 0.30 + 4.7));
+    g *= mix(1.0, 0.42, sh * 0.85);
+
+    // simple lighting + aerial perspective
+    g *= SUN_COLOR * 1.05 + vec3(0.15, 0.16, 0.22);
+    float fog = 1.0 - exp(-t * 0.030);
+    return mix(g, vec3(0.75, 0.62, 0.55), fog);
+}
+
+//-------------------------- volume raymarch --------------------------------
+vec4 marchClouds(vec3 ro, vec3 rd, float t0, float t1, float dither)
+{
+    float dt    = (t1 - t0) / float(PRIMARY_STEPS);
+    float t     = t0 + dt * dither;
+    vec3  acc   = vec3(0.0);
+    float trans = 1.0;
+    float odEye = 0.0;
+
+    // multi-lobe HG phase (backward + forward + silver-lining spike)
+    float mu = dot(rd, SUN_DIR);
+    float phase = 4.0 * PI * (hgPhase(mu, -0.25) * 0.15
+                            + hgPhase(mu,  0.65) * 0.73
+                            + hgPhase(mu,  0.90) * 0.12);
+
+    for (int i = 0; i < PRIMARY_STEPS; i++)
+    {
+        vec3  p    = ro + rd * t;
+        float dens = cloudDensity(p, true) * DENSITY;
+        dens *= 1.0 - smoothstep(FAR_CLIP * 0.62, FAR_CLIP, t); // distance fade
+
+        if (dens > 0.002)
+        {
+            float h   = (p.y - CLOUD_BOTTOM) / (CLOUD_TOP - CLOUD_BOTTOM);
+            float vis = sunVisibility(p);
+
+            // powder-ish darkening of the near rim facing the camera
+            float rim = 0.6 + 0.4 * (1.0 - exp(-odEye * 6.0));
+
+            vec3 sun = SUN_COLOR * SUN_INTENSITY * vis * phase * 1.5 * rim;
+            vec3 amb = mix(AMBIENT_BOT, AMBIENT_TOP, h) * (0.8 + 0.4 * vis);
+            amb *= 0.55 + 0.45 * exp(-odEye * 0.8);   // interior ambient occlusion
+            vec3 S   = sun + amb;   // in-scattered source radiance
+
+            float stepT = exp(-dens * dt);          // Beer-Lambert
+            acc   += trans * S * (1.0 - stepT);     // energy-conserving step
+            trans *= stepT;
+            odEye += dens * dt;
+
+            if (trans < 0.01) break;                // early termination
+        }
+        t += dt;
+    }
+    return vec4(acc, trans);
+}
+
+//------------------------------ tonemap ------------------------------------
+// Narkowicz ACES fit (linear in; gamma applied afterwards)
+vec3 aces(vec3 x)
+{
+    return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14),
+                 0.0, 1.0);
+}
+
+//-------------------------------- main -------------------------------------
+void mainImage(out vec4 fragColor, in vec2 fragCoord)
+{
+    vec2 uv = (2.0 * fragCoord - iResolution.xy) / iResolution.y;
+
+    // ---- camera: mouse free-look, otherwise cinematic auto-flight ----
+    float yaw, pitch;
+    if (iMouse.z > 0.0)
+    {
+        vec2 m = iMouse.xy / iResolution.xy - 0.5;
+        yaw   = 2.6 + m.x * 6.0;
+        pitch = 0.30 + m.y * 1.6;
+    }
+    else
+    {
+        yaw   = 2.6 + 0.30 * sin(iTime * 0.050);
+        pitch = 0.34 + 0.08 * sin(iTime * 0.083);
+    }
+    pitch = clamp(pitch, -1.3, 1.3);
+
+    vec3 ro = vec3(0.0, 0.40, 0.0);
+    ro.xz  += vec2(sin(2.6), cos(2.6)) * (iTime * CAMERA_SPEED);
+
+    vec3 fwd = vec3(sin(yaw) * cos(pitch), sin(pitch), cos(yaw) * cos(pitch));
+    vec3 rgt = normalize(cross(vec3(0.0, 1.0, 0.0), fwd));
+    vec3 up  = cross(fwd, rgt);
+    vec3 rd  = normalize(fwd * 1.7 + uv.x * rgt + uv.y * up);
+
+    // ---- background: sky or procedural ground ----
+    float groundT = 1.0e9;
+    if (rd.y < -0.0005) groundT = -ro.y / rd.y;
+    vec3 bg = skyColor(rd);
+    if (groundT < 1.0e8) bg = groundColor(ro + rd * groundT, groundT);
+
+    // ---- intersect the cloud slab [CLOUD_BOTTOM, CLOUD_TOP] ----
+    float ry = rd.y;
+    if (abs(ry) < 1.0e-4) ry = (ry >= 0.0) ? 1.0e-4 : -1.0e-4;
+    float ta = (CLOUD_BOTTOM - ro.y) / ry;
+    float tb = (CLOUD_TOP    - ro.y) / ry;
+    float t0 = max(min(ta, tb), 0.0);
+    float t1 = min(min(max(ta, tb), groundT), FAR_CLIP);
+
+    vec3 col = bg;
+    if (t1 > t0)
+    {
+        float dither = hash13(vec3(fragCoord, 1.7));   // static: no flicker
+        vec4  cl     = marchClouds(ro, rd, t0, t1, dither);
+        col = cl.rgb + bg * cl.a;                      // composite over sky
+    }
+
+    // ---- post-processing ----
+    col = max(col, vec3(0.0));
+    col = aces(col * 0.85);
+    col = pow(col, vec3(0.4545));                      // gamma
+    float lum = dot(col, vec3(0.2126, 0.7152, 0.0722));
+    col = mix(vec3(lum), col, 1.10);                   // gentle saturation
+    col = mix(col, smoothstep(0.0, 1.0, col), 0.20);   // gentle contrast
+    vec2 q = fragCoord / iResolution.xy;
+    col *= 0.55 + 0.45 * pow(16.0 * q.x * q.y * (1.0 - q.x) * (1.0 - q.y), 0.18);
+    col += (hash13(vec3(fragCoord, mod(float(iFrame), 256.0))) - 0.5) * 0.012;
+
+    fragColor = vec4(col, 1.0);
+}
